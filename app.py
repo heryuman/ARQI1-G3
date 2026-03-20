@@ -72,11 +72,11 @@ LOGIC_LOOP_SECONDS = 0.2
 OUTPUT_LOOP_SECONDS = 0.1
 DISPLAY_LOOP_SECONDS = 0.2
 
-# Si tu relé activa con HIGH, dejalo True.
+# Si el relé activa con HIGH, dejalo True.
 # Si activa con LOW, cambialo a False.
 RELAY_ACTIVE_HIGH = True
 
-# Si tus buses RGB se encienden con HIGH, dejalo True.
+# Si los buses RGB se encienden con HIGH, dejalo True.
 # Si los armaste con driver invertido, cambialo a False.
 RGB_ACTIVE_HIGH = True
 
