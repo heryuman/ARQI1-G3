@@ -1,6 +1,9 @@
 import time
+import json
+import queue
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import RPi.GPIO as GPIO
 import spidev
@@ -9,6 +12,8 @@ import busio
 import adafruit_tcs34725
 import adafruit_dht
 from rpi_lcd import LCD
+import paho.mqtt.client as mqtt
+from pymongo import MongoClient
 
 # =========================================================
 # GPIO ACORDADOS
@@ -19,45 +24,45 @@ DHT_GPIO = 4
 TRIG_GPIO = 17
 ECHO_GPIO = 27
 
-# Actuadores reservados para siguiente etapa
+# Reservados para siguiente etapa
 SERVO_GPIO = 18
 STEPPER_PINS = [5, 6, 13, 19]
 
 # Buzzer
 BUZZER_GPIO = 23
 
-# Bloque de LEDs acordado
+# LEDs acordados
 # Reutilización práctica:
-# GPIO21 -> bus R de 8 LEDs RGB
-# GPIO16 -> bus G de 8 LEDs RGB
-# GPIO26 -> bus B de 8 LEDs RGB
+# GPIO21 -> bus R de 8 RGB
+# GPIO16 -> bus G de 8 RGB
+# GPIO26 -> bus B de 8 RGB
 # GPIO20 -> LED amarillo de estado
 RGB_R_GPIO = 21
 RGB_G_GPIO = 16
 RGB_B_GPIO = 26
 LED_AMARILLO_GPIO = 20
 
-# Ventiladores por relé suelto + transistor driver
+# Ventiladores
 FAN_RELAY_GPIO = 24
 
-# Botones (reservados)
+# Botones reservados
 BTN_COMPUERTA_GPIO = 12
 BTN_TORRETA_IZQ_GPIO = 22
 BTN_TORRETA_DER_GPIO = 25
 BTN_DISPARO_GPIO = 7
 BTN_EMERGENCIA_GPIO = 1
 
-# MCP3208
+# ADC
 ADC_CHANNEL_GAS = 0
 ADC_CHANNEL_SOIL = 1
 
 # =========================================================
-# CONFIGURACIÓN
+# CONFIG
 # =========================================================
 
 GAS_THRESHOLD = 260
-TEMP_THRESHOLD=25
 SOIL_DRY_THRESHOLD = 3000
+TEMP_THRESHOLD = 30
 
 DIST_LEJANO_CM = 50
 DIST_CERCANO_CM = 20
@@ -71,16 +76,29 @@ SENSOR_READ_SECONDS = 1.0
 LOGIC_LOOP_SECONDS = 0.2
 OUTPUT_LOOP_SECONDS = 0.1
 DISPLAY_LOOP_SECONDS = 0.2
+MQTT_PUBLISH_SECONDS = 2.0
 
-# Si el relé activa con HIGH, dejalo True.
-# Si activa con LOW, cambialo a False.
 RELAY_ACTIVE_HIGH = True
-
-# Si los buses RGB se encienden con HIGH, dejalo True.
-# Si los armaste con driver invertido, cambialo a False.
 RGB_ACTIVE_HIGH = True
-
 ENABLE_BUZZER = True
+
+MQTT_BROKER = "broker.emqx.io"
+MQTT_PORT = 1883
+
+TOPIC_GAS = "nave/sensores/gas/gp3"
+TOPIC_PROX = "nave/sensores/proximidad/gp3"
+TOPIC_COLOR = "nave/sensores/color/gp3"
+TOPIC_AMB = "nave/sensores/ambiente/gp3"
+TOPIC_SOIL = "nave/sensores/suelo/gp3"
+TOPIC_STATE = "nave/estado/gp3"
+
+TOPIC_TORRETA_CMD = "nave/actuadores/torreta/gp3"
+TOPIC_COMPUERTA_CMD = "nave/actuadores/compuertas/gp3"
+TOPIC_MSG = "nave/control/mensajes/gp3"
+TOPIC_ALERT = "nave/alertas/criticas/gp3"
+
+MONGO_URI = "mongodb://localhost:27017/"
+MONGO_DB_NAME = "nave_espacial"
 
 # =========================================================
 # ESTADO COMPARTIDO
@@ -102,6 +120,7 @@ class SharedState:
     detected_color: str = "desconocido"
 
     gas_alert: bool = False
+    temp_alert: bool = False
     soil_dry: bool = False
     meteor_level: str = "sin_lectura"
 
@@ -117,10 +136,20 @@ class SharedState:
     last_good_temp: float | None = None
     last_good_humidity: float | None = None
 
+    total_gas_alerts: int = 0
+    total_meteor_events: int = 0
+    total_messages: int = 0
+
+    dashboard_message: str = ""
+    dashboard_message_until: float = 0.0
+
 
 state = SharedState()
 state_lock = threading.Lock()
 stop_event = threading.Event()
+
+mongo_queue = queue.Queue()
+command_queue = queue.Queue()
 
 # =========================================================
 # HARDWARE INIT
@@ -129,39 +158,30 @@ stop_event = threading.Event()
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-# HC-SR04
 GPIO.setup(TRIG_GPIO, GPIO.OUT)
 GPIO.setup(ECHO_GPIO, GPIO.IN)
 GPIO.output(TRIG_GPIO, False)
 
-# Relay ventiladores
 GPIO.setup(FAN_RELAY_GPIO, GPIO.OUT)
 
-# RGB buses + LED estado
 GPIO.setup(RGB_R_GPIO, GPIO.OUT)
 GPIO.setup(RGB_G_GPIO, GPIO.OUT)
 GPIO.setup(RGB_B_GPIO, GPIO.OUT)
 GPIO.setup(LED_AMARILLO_GPIO, GPIO.OUT)
 
-# Buzzer
 GPIO.setup(BUZZER_GPIO, GPIO.OUT)
 
-# Estado inicial de salidas
 GPIO.output(BUZZER_GPIO, GPIO.LOW)
 GPIO.output(LED_AMARILLO_GPIO, GPIO.LOW)
 
-# LCD
 lcd = LCD()
 
-# SPI MCP3208
 spi = spidev.SpiDev()
 spi.open(0, 0)
 spi.max_speed_hz = 1350000
 
-# DHT22
 dht = adafruit_dht.DHT22(board.D4, use_pulseio=False)
 
-# I2C + TCS34725
 i2c = busio.I2C(board.SCL, board.SDA)
 tcs = adafruit_tcs34725.TCS34725(i2c)
 tcs.integration_time = 50
@@ -170,6 +190,16 @@ tcs.gain = 4
 # =========================================================
 # HELPERS
 # =========================================================
+
+def now_iso():
+    return datetime.utcnow().isoformat()
+
+def push_mongo(collection: str, payload: dict):
+    mongo_queue.put({
+        "collection": collection,
+        "payload": payload,
+        "timestamp": now_iso()
+    })
 
 def lcd_write(line1="", line2=""):
     try:
@@ -206,8 +236,7 @@ def read_distance():
             return None
 
     duracion = pulso_fin - pulso_inicio
-    distancia = duracion * 17150
-    return round(distancia, 2)
+    return round(duracion * 17150, 2)
 
 def classify_color(r, g, b):
     if max(r, g, b) < 25:
@@ -282,7 +311,6 @@ class SensorThread(threading.Thread):
 
     def run(self):
         while not stop_event.is_set():
-            # DHT22
             temp = None
             hum = None
             try:
@@ -293,27 +321,24 @@ class SensorThread(threading.Thread):
             except Exception as e:
                 print("DHT22 error:", e)
 
-            # HC-SR04
             try:
                 dist = read_distance()
             except Exception as e:
                 print("HC-SR04 error:", e)
                 dist = None
 
-            # MCP3208
             try:
                 gas = read_mcp3208(ADC_CHANNEL_GAS)
             except Exception as e:
-                print("MQ2/MCP3208 error:", e)
+                print("MQ2 error:", e)
                 gas = 0
 
             try:
                 soil = read_mcp3208(ADC_CHANNEL_SOIL)
             except Exception as e:
-                print("FC28/MCP3208 error:", e)
+                print("FC28 error:", e)
                 soil = 0
 
-            # TCS34725
             color_name = "desconocido"
             r = g = b = c = 0
             lux = None
@@ -353,11 +378,28 @@ class SensorThread(threading.Thread):
                 state.lux = lux
                 state.detected_color = color_name
 
+                payload = {
+                    "temperature": state.temperature,
+                    "humidity": state.humidity,
+                    "distance_cm": state.distance_cm,
+                    "gas_value": state.gas_value,
+                    "soil_value": state.soil_value,
+                    "color_r": state.color_r,
+                    "color_g": state.color_g,
+                    "color_b": state.color_b,
+                    "color_clear": state.color_clear,
+                    "lux": state.lux,
+                    "detected_color": state.detected_color,
+                }
+
+            push_mongo("sensor_readings", payload)
             time.sleep(SENSOR_READ_SECONDS)
 
 class LogicThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
+        self.last_gas_event = False
+        self.last_meteor_level = "sin_lectura"
 
     def run(self):
         while not stop_event.is_set():
@@ -368,20 +410,14 @@ class LogicThread(threading.Thread):
                 soil = state.soil_value
                 dist = state.distance_cm
                 detected_color = state.detected_color
-                temp=state.temperature
-                # Gas / ventiladores
+                temp = state.temperature
+
                 state.gas_alert = gas >= GAS_THRESHOLD
-
-                # Temperatura
                 state.temp_alert = temp is not None and temp >= TEMP_THRESHOLD
-
-                # Ventiladores (OR lógico)
                 state.fans_on = state.gas_alert or state.temp_alert
 
-                # Suelo
                 state.soil_dry = soil >= SOIL_DRY_THRESHOLD
 
-                # Meteorito
                 if dist is None:
                     state.meteor_level = "sin_lectura"
                 elif dist > DIST_LEJANO_CM:
@@ -391,7 +427,6 @@ class LogicThread(threading.Thread):
                 else:
                     state.meteor_level = "impacto"
 
-                # Secuencia de camuflaje
                 if detected_color in ["rojo", "amarillo", "azul"]:
                     if not state.recent_colors or detected_color != state.recent_colors[-1]:
                         state.recent_colors.append(detected_color)
@@ -407,16 +442,22 @@ class LogicThread(threading.Thread):
                     state.recent_colors.clear()
                     state.recent_color_times.clear()
 
+                    push_mongo("events", {
+                        "event": "camouflage_activated",
+                        "detected_color": detected_color
+                    })
+
                 if state.camouflage_active and now > state.camouflage_until:
                     state.camouflage_active = False
+                    push_mongo("events", {
+                        "event": "camouflage_deactivated"
+                    })
 
-                # RGB actual
                 if state.camouflage_active:
                     state.rgb_color = detected_color
                 else:
                     state.rgb_color = "apagado"
 
-                # Estado general
                 if state.gas_alert:
                     state.status_text = "ALERTA GAS"
                 elif state.temp_alert:
@@ -432,6 +473,24 @@ class LogicThread(threading.Thread):
                 else:
                     state.status_text = "OPERATIVA"
 
+                if state.gas_alert and not self.last_gas_event:
+                    state.total_gas_alerts += 1
+                    push_mongo("events", {
+                        "event": "gas_alert",
+                        "gas_value": state.gas_value
+                    })
+
+                if state.meteor_level != self.last_meteor_level and state.meteor_level in ["lejano", "cercano", "impacto"]:
+                    state.total_meteor_events += 1
+                    push_mongo("events", {
+                        "event": "meteor_detected",
+                        "level": state.meteor_level,
+                        "distance_cm": state.distance_cm
+                    })
+
+                self.last_gas_event = state.gas_alert
+                self.last_meteor_level = state.meteor_level
+
             time.sleep(LOGIC_LOOP_SECONDS)
 
 class OutputThread(threading.Thread):
@@ -446,28 +505,19 @@ class OutputThread(threading.Thread):
                 rgb_color = state.rgb_color
                 gas_alert = state.gas_alert
                 meteor_level = state.meteor_level
-                temp_alert=state.temp_alert    
-            # Relay ventiladores
+
             relay_set(fans_on)
 
-            # RGB buses
             if rgb_color == "apagado":
                 rgb_off()
             else:
                 show_color(rgb_color)
 
-            # LED amarillo de estado
             set_led_amarillo(gas_alert)
 
-            # Buzzer simple
             now = time.time()
             if ENABLE_BUZZER:
                 if gas_alert:
-                    buzzer_set(True)
-                    time.sleep(0.08)
-                    buzzer_set(False)
-                    time.sleep(0.12)
-                elif temp_alert:
                     buzzer_set(True)
                     time.sleep(0.08)
                     buzzer_set(False)
@@ -510,8 +560,12 @@ class DisplayThread(threading.Thread):
                 soil = state.soil_value
                 color = state.detected_color
                 status = state.status_text
+                msg = state.dashboard_message
+                msg_until = state.dashboard_message_until
 
-            if status == "ALERTA GAS":
+            if msg and now < msg_until:
+                lcd_write("Mensaje", msg)
+            elif status == "ALERTA GAS":
                 lcd_write("ALERTA GAS", f"MQ2:{gas}")
             elif self.screen == 0:
                 lcd_write(f"T:{temp if temp is not None else '--'}C",
@@ -524,6 +578,190 @@ class DisplayThread(threading.Thread):
                 lcd_write(color, status)
 
             time.sleep(DISPLAY_LOOP_SECONDS)
+import json
+import time
+import random
+import threading
+import paho.mqtt.client as mqtt
+
+class MQTTThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+
+        client_id = f'python-mqtt-{random.randint(0,1000)}'
+        self.client = mqtt.Client(client_id=client_id)
+
+        # Si luego necesitás usuario/password:
+        self.client.username_pw_set("emqx", "public")
+
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+
+        # Reintentos automáticos con backoff
+        self.client.reconnect_delay_set(min_delay=2, max_delay=15)
+
+        self.connected = False
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected = True
+            print("MQTT conectado correctamente")
+
+            client.subscribe(TOPIC_MSG, qos=1)
+            client.subscribe(TOPIC_ALERT, qos=1)
+
+            # Si luego activás torreta y compuerta:
+            # client.subscribe(TOPIC_TORRETA_CMD, qos=1)
+            # client.subscribe(TOPIC_COMPUERTA_CMD, qos=1)
+        else:
+            self.connected = False
+            print(f"MQTT error de conexión, rc={rc}")
+
+    def on_disconnect(self, client, userdata, rc):
+        self.connected = False
+
+        if rc != 0:
+            print(f"MQTT desconectado inesperadamente, rc={rc}")
+        else:
+            print("MQTT desconectado normalmente")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+        except Exception:
+            payload = {"raw": msg.payload.decode(errors="ignore")}
+
+        topic = msg.topic
+        print("MQTT RX:", topic, payload)
+
+        if topic == TOPIC_MSG:
+            text = str(payload.get("message", ""))[:64]
+            with state_lock:
+                state.dashboard_message = text
+                state.dashboard_message_until = time.time() + 5
+                state.total_messages += 1
+
+            push_mongo("messages", {"message": text})
+            push_mongo("commands", {"topic": topic, "payload": payload})
+
+        elif topic == TOPIC_ALERT:
+            action = payload.get("action")
+
+            if action == "camouflage_on":
+                with state_lock:
+                    state.camouflage_active = True
+                    state.camouflage_until = time.time() + CAMOUFLAGE_ACTIVE_SECONDS
+
+            elif action == "camouflage_off":
+                with state_lock:
+                    state.camouflage_active = False
+
+            push_mongo("commands", {"topic": topic, "payload": payload})
+
+    def connect_with_retry(self):
+        while not stop_event.is_set():
+            try:
+                print(f"Intentando conectar a MQTT {MQTT_BROKER}:{MQTT_PORT} ...")
+                self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                return
+            except Exception as e:
+                print("No se pudo conectar al broker:", e)
+                time.sleep(5)
+
+    def run(self):
+        self.connect_with_retry()
+        self.client.loop_start()
+
+        try:
+            while not stop_event.is_set():
+                if not self.connected:
+                    print("MQTT no conectado, esperando reconexión...")
+                    time.sleep(2)
+                    continue
+
+                with state_lock:
+                    payload_gas = {
+                        "value": state.gas_value,
+                        "alert": state.gas_alert,
+                        "timestamp": now_iso()
+                    }
+                    payload_prox = {
+                        "distance_cm": state.distance_cm,
+                        "level": state.meteor_level,
+                        "timestamp": now_iso()
+                    }
+                    payload_color = {
+                        "r": state.color_r,
+                        "g": state.color_g,
+                        "b": state.color_b,
+                        "lux": state.lux,
+                        "detected_color": state.detected_color,
+                        "camouflage_active": state.camouflage_active,
+                        "timestamp": now_iso()
+                    }
+                    payload_amb = {
+                        "temperature": state.temperature,
+                        "humidity": state.humidity,
+                        "temp_alert": state.temp_alert,
+                        "timestamp": now_iso()
+                    }
+                    payload_soil = {
+                        "soil_value": state.soil_value,
+                        "soil_dry": state.soil_dry,
+                        "timestamp": now_iso()
+                    }
+                    payload_state = {
+                        "status": state.status_text,
+                        "fans_on": state.fans_on,
+                        "rgb_color": state.rgb_color,
+                        "gas_alerts": state.total_gas_alerts,
+                        "meteor_events": state.total_meteor_events,
+                        "messages": state.total_messages,
+                        "timestamp": now_iso()
+                    }
+
+                try:
+                    self.client.publish(TOPIC_GAS, json.dumps(payload_gas), qos=0)
+                    self.client.publish(TOPIC_PROX, json.dumps(payload_prox), qos=0)
+                    self.client.publish(TOPIC_COLOR, json.dumps(payload_color), qos=0)
+                    self.client.publish(TOPIC_AMB, json.dumps(payload_amb), qos=0)
+                    self.client.publish(TOPIC_SOIL, json.dumps(payload_soil), qos=0)
+                    self.client.publish(TOPIC_STATE, json.dumps(payload_state), qos=0)
+                except Exception as e:
+                    print("Error publicando MQTT:", e)
+
+                time.sleep(MQTT_PUBLISH_SECONDS)
+
+        finally:
+            try:
+                self.client.loop_stop()
+            except Exception:
+                pass
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+
+class MongoThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.client = MongoClient(MONGO_URI)
+        self.db = self.client[MONGO_DB_NAME]
+
+    def run(self):
+        while not stop_event.is_set():
+            try:
+                item = mongo_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                doc = dict(item["payload"])
+                doc["timestamp"] = item["timestamp"]
+                self.db[item["collection"]].insert_one(doc)
+            except Exception as e:
+                print("Mongo insert error:", e)
 
 # =========================================================
 # MAIN
@@ -535,10 +773,12 @@ def main():
         LogicThread(),
         OutputThread(),
         DisplayThread(),
+        MQTTThread(),
+        MongoThread(),
     ]
 
     try:
-        lcd_write("Iniciando", "Sistema...")
+        lcd_write("Iniciando", "MQTT+Mongo")
         rgb_off()
         relay_set(False)
         set_led_amarillo(False)
@@ -555,7 +795,7 @@ def main():
                 print(f"Dist     : {state.distance_cm} cm")
                 print(f"MQ2/FC28 : {state.gas_value} / {state.soil_value}")
                 print(f"Color    : {state.detected_color} | RGB=({state.color_r},{state.color_g},{state.color_b})")
-                print(f"GasAlert : {state.gas_alert} | Fans: {state.fans_on}")
+                print(f"Fans     : {state.fans_on} | Gas: {state.gas_alert} | Temp: {state.temp_alert}")
                 print(f"Meteor   : {state.meteor_level}")
                 print(f"Camuflaje: {state.camouflage_active} | RGB out: {state.rgb_color}")
                 print(f"Estado   : {state.status_text}")
