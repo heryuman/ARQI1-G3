@@ -1,0 +1,66 @@
+DHT_GPIO = 4
+TRIG_GPIO = 17
+ECHO_GPIO = 27
+
+SERVO_GPIO = 18
+STEPPER_PINS = [5, 6, 13, 19]
+
+BUZZER_GPIO = 23
+
+RGB_R_GPIO = 21
+RGB_G_GPIO = 16
+RGB_B_GPIO = 26
+LED_AMARILLO_GPIO = 20
+
+FAN_RELAY_GPIO = 24
+
+BTN_COMPUERTA_GPIO = 12
+BTN_TORRETA_IZQ_GPIO = 22
+BTN_TORRETA_DER_GPIO = 25
+BTN_DISPARO_GPIO = 7
+BTN_EMERGENCIA_GPIO = 1
+
+ADC_CHANNEL_GAS = 0
+ADC_CHANNEL_SOIL = 1
+
+GAS_THRESHOLD = 260
+SOIL_DRY_THRESHOLD = 3000
+TEMP_THRESHOLD = 30
+
+DIST_LEJANO_CM = 50
+DIST_CERCANO_CM = 20
+
+CAMOUFLAGE_SEQUENCE = ["rojo", "amarillo", "azul"]
+CAMOUFLAGE_SEQUENCE_TIMEOUT = 15
+CAMOUFLAGE_ACTIVE_SECONDS = 20
+
+DISPLAY_ROTATE_SECONDS = 3
+SENSOR_READ_SECONDS = 1.0
+LOGIC_LOOP_SECONDS = 0.2
+OUTPUT_LOOP_SECONDS = 0.1
+DISPLAY_LOOP_SECONDS = 0.2
+MQTT_PUBLISH_SECONDS = 2.0
+
+RELAY_ACTIVE_HIGH = True
+RGB_ACTIVE_HIGH = True
+ENABLE_BUZZER = True
+
+MQTT_BROKER = "broker.emqx.io"
+MQTT_PORT = 1883
+MQTT_USERNAME = "emqx"
+MQTT_PASSWORD = "public"
+
+TOPIC_GAS = "nave/sensores/gas/gp3"
+TOPIC_PROX = "nave/sensores/proximidad/gp3"
+TOPIC_COLOR = "nave/sensores/color/gp3"
+TOPIC_AMB = "nave/sensores/ambiente/gp3"
+TOPIC_SOIL = "nave/sensores/suelo/gp3"
+TOPIC_STATE = "nave/estado/gp3"
+
+TOPIC_TORRETA_CMD = "nave/actuadores/torreta/gp3"
+TOPIC_COMPUERTA_CMD = "nave/actuadores/compuertas/gp3"
+TOPIC_MSG = "nave/control/mensajes/gp3"
+TOPIC_ALERT = "nave/alertas/criticas/gp3"
+
+MONGO_URI = "mongodb://localhost:27017/"
+MONGO_DB_NAME = "nave_espacial"
