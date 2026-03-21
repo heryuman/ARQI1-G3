@@ -7,3 +7,8 @@
 |----|----|----|
 |rbg3|grupo3|kr*nos|
 |||
+
+## Documentacion 
+- [Documentacion tecnica](/docs/Documentacion_tecnica.pdf)
+
+- [Diagrama Físico](/docs/diag_fisico.pdf)
